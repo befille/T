@@ -9,7 +9,9 @@ residual = x
 learned paremeters XD
 
 x' = Attention(x)
+
 y = einsum (x', XD)
+
 x = y * F.silu(XD)
 
 x = x + residual
