@@ -321,7 +321,7 @@ class Test(nn.Module):
         fd = -torch.exp(xd)
         y = torch.einsum('bht,bht->bht', x, fd)
         x = y * F.silu(xd)
-        x = fd + resi
+        x = x + resi
 
         resi = x 
         x = self.feed(x)
