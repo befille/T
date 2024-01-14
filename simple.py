@@ -79,8 +79,7 @@ class MambaBlock(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(dim_inner))
         self.out_proj = nn.Linear(dim_inner, dim, bias=bias)
-        self.feed1 = FeedForward(d_state, 4)
-        self.feed2 = FeedForward(dim_inner, 4)
+
 
 
 
