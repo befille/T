@@ -420,30 +420,47 @@ losses = []
 fig, ax = plt.subplots()
 
 # Train the model
-def train(model, criterion, optimizer, x_batch, y_batch, num_epochs=1000):
+def train(model, criterion, optimizer, x_train, y_train, num_epochs=2000):
     # Set the model to training mode
     model.train()
+    losses = []
+    val_losses = []
     plt.suptitle('Training Loss')
-        # Loop over the specified number of epochs
-    for epoch in range(num_epochs):
-        # Zero the gradients of the optimizer
-        optimizer.zero_grad()
-        model.zero_grad()
-        output_tensor = model(x_batch)
-        loss = criterion(output_tensor, y_batch)
-        loss.backward()
-        # Update the weights
-        optimizer.step()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-        #for name, param in model.named_parameters():
-        #    if param.grad is not None:
-        #        print(f"{name}: {param.grad.data.abs().mean()}")
-        losses.append(loss.item())
-        ## Update the data in the subplots
-        ax.plot(losses, label='Training Loss')
 
-        ## Call the draw method to update the plot
-        plt.draw()
-        plt.pause(0.01)
+    # Loop over the specified number of epochs
+    for epoch in range(num_epochs):
+        try:
+            # Zero the gradients of the optimizer
+            optimizer.zero_grad()
+            model.zero_grad()
+            if (epoch + 1) % 100 == 0:
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                        output_tensor = model(x_train)
+                        val_loss += criterion(output_tensor, y_train).item()
+                val_losses.append(val_loss)
+                print(f'Epoch {epoch+1}, Validation Loss: {val_loss:.4f}')
+                model.train()
+
+            output_tensor = model(x_train)
+            loss = criterion(output_tensor, y_train)
+            loss.backward()
+            # Update the weights
+            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            losses.append(loss.item())
+
+            # Validate the model every 100 epochs
+            ## Update the data in the subplots
+            ax.plot(losses, label='Training Loss')
+            ax.plot(val_losses, label='Validation Loss')
+            ## Call the draw method to update the plot
+            plt.draw()
+            plt.pause(0.01)
+        except KeyboardInterrupt:
+            print('exit')
+            break
+
 
 train(model, criterion, optimizer, context_window, tar)
