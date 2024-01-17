@@ -58,14 +58,10 @@ class MambaBlock(nn.Module):
         # If dim_inner is not provided, set it to dim * expand
         self.in_proj = nn.Linear(dim, dim_inner * 2, bias=bias)
 
-        self.conv1d = nn.Conv1d(
-            in_channels=dim_inner,
-            out_channels=dim_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=dim_inner,
-            padding=d_conv - 1,
-        )
+        self.depthwise_separable_conv = nn.Sequential(
+            nn.Conv1d(in_channels=dim_inner, out_channels=dim_inner, kernel_size=d_conv, groups=dim_inner, padding=d_conv - 1, bias=False),
+            nn.Conv1d(in_channels=dim_inner, out_channels=dim_inner, kernel_size=1, bias=False)
+        )  #https://arxiv.org/pdf/1610.02357.pdf 
 
         # x_proj takes in `x` and outputs the input-specific Δ, B, C
         self.x_proj = nn.Linear(
@@ -105,7 +101,7 @@ class MambaBlock(nn.Module):
             split_size=[self.dim_inner, self.dim_inner], dim=1
         )
 
-        x = self.conv1d(x)[:, :, :l]
+        x = self.depthwise_separable_conv(x)[:, :, :l]
         x = F.silu(x)
 
         y = self.ssm(x)
