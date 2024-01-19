@@ -73,7 +73,8 @@ class MambaBlock(nn.Module):
 
         A = repeat(torch.arange(1, self.d_state + 1), "n -> d n", d=dim_inner)
         self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(dim_inner))
+        self.D = nn.Parameter(torch.empty(dim_inner))
+        nn.init.uniform_(self.D, a=0.001, b=0.1)
         self.out_proj = nn.Linear(dim_inner, dim, bias=bias)
 
 
