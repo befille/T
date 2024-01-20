@@ -41,7 +41,7 @@ model = Mamba(
     d_conv=4,    # Local convolution width
     expand=2,    # Block expansion factor
 ).cuda()
-torch.manual_seed(2)
+torch.manual_seed(42)
 
 context_window, target = load_and_split_dataset(256, 1)
 
@@ -49,7 +49,7 @@ context_window, target = load_and_split_dataset(256, 1)
 context_window = context_window.unsqueeze(0)
 context_window = context_window.permute(0,2,1)
 
-optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.1, lr=0.000001,  betas =(0.95, 0.999), eps=0.001)
+optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.1, lr=0.0000012,  betas =(0.95, 0.999), eps=0.001)
 
 criterion = nn.CrossEntropyLoss()
 
@@ -68,7 +68,7 @@ def train(model, criterion, optimizer, x_batch, y_batch, num_epochs=1000):
         optimizer.zero_grad()
         model.zero_grad()
         output_tensor = model(x_batch)
-        output_tensor= output_tensor[:,:, 0]
+        output_tensor= output_tensor[:,:, -1]
 
         loss = criterion(output_tensor, y_batch)
         #print(loss)
