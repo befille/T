@@ -41,6 +41,7 @@ model = Mamba(
     d_conv=4,    # Local convolution width
     expand=2,    # Block expansion factor
 ).cuda()
+torch.manual_seed(2)
 
 context_window, target = load_and_split_dataset(256, 1)
 
