@@ -49,8 +49,7 @@ context_window, target = load_and_split_dataset(256, 1)
 context_window = context_window.unsqueeze(0)
 context_window = context_window.permute(0,2,1)
 
-optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.1, lr=0.0000012,  betas =(0.95, 0.999), eps=0.001)
-
+optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.1, lr=0.0000012,  betas =(0.95, 0.999), eps=0.0001)
 criterion = nn.CrossEntropyLoss()
 
 # Train the model
@@ -83,8 +82,9 @@ def train(model, criterion, optimizer, x_batch, y_batch, num_epochs=1000):
             num_batches = 0  # Reset the number of batches
         loss.backward()
         # Update the weights
+        torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=4.0)
         optimizer.step()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+
 
 
 train(model, criterion, optimizer, context_window, target)
