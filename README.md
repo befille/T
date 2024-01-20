@@ -15,3 +15,6 @@ y = einsum (x', XD)
 x = y * F.silu(XD)
 
 x = x + residual
+
+
+offical = just quick implementation using the offical simple mamba
