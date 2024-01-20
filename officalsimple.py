@@ -34,7 +34,6 @@ def load_and_split_dataset(context_len, horizon, load=True):
 
 
 
-positive = False   #all datapoints  are positive
 model = Mamba(
     # This module uses roughly 3 * expand * d_model^2 parameters
     d_model=256 , # Model dimension d_model
