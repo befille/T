@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from mamba_ssm.modules.mamba_simple import Mamba
 
-import torch.optim.lr_scheduler as lr_scheduler
+
 
 def load_and_split_dataset(context_len, horizon, load=True):
     # Load the dataset from the CSV file or the Hugging Face repository
@@ -84,7 +84,7 @@ optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.1, lr=1e-07,  betas =
 
 criterion = nn.CrossEntropyLoss()
 
-context_window, target = load_and_split_dataset(256, horizon)
+context_window, target = load_and_split_dataset(d_model, horizon)
 
 context_window = context_window.unsqueeze(0)
 context_window = context_window.permute(0,2,1)
