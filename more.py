@@ -324,8 +324,8 @@ class Test(nn.Module):
         x = x + resi
 
         resi = x 
-        x = self.feed(x)
         x = self.rmsnormf(x)
+        x = self.feed(x)
         x = x + resi
 
         x = self.out(x)
