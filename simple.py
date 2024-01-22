@@ -317,7 +317,7 @@ class MOEMamba(nn.Module):
                     no_decay.add(fpn)
                 if fpn.startswith('mamba'):
                     if pn in ['A_log', 'D']:
-                        decay.add(fpn) 
+                        no_decay.add(fpn) 
         # validate that we considered every parameter
                     
         param_dict = {pn: p for pn, p in self.named_parameters()}
