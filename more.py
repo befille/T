@@ -159,9 +159,9 @@ class attention2(nn.Module):
         
         self.o_proj = nn.Linear(h_dim,  h_dim, bias=attention_bias)
         
-        self.etab = nn.Parameter(torch.ones(1, len, self.d_model))
-        self.etac = nn.Parameter(torch.ones(1, len, self.d_model))
-        self.eta = nn.Parameter(torch.ones(h_dim, self.d_model))
+        self.etab = nn.Parameter(torch.empty(1, len, self.d_model))
+        self.etac = nn.Parameter(torch.empty(1, len, self.d_model))
+        self.eta = nn.Parameter(torch.empty(h_dim, self.d_model))
         nn.init.uniform_(self.etab, a=0.001, b=0.1)
         nn.init.uniform_(self.etac, a=0.001, b=0.1)
         nn.init.uniform_(self.eta, a=0.001, b=0.1)
@@ -186,7 +186,7 @@ class attention2(nn.Module):
         x = torch.zeros((bsz, _, self.d_model)).cuda()
         ys = []
         for i in range(self.len):
-            x = r[:, :, i] * x - g[:, :, i]* r[:, :, i]
+            x = r[:, :, i] * x - g[:, :, i]* r[:, :, i] / 2
             y = einsum(x, self.etac[:, i, :], "b d_in n , b n -> b d_in")
             ys.append(y)
         y = torch.stack(ys, dim=2)# (b d_in l)
@@ -488,7 +488,7 @@ model = Test(
  
 model.init_weights() 
 
-learning_rate = 0.000002
+learning_rate = 0.000001
 betas = (0.95, 0.999)
 
 optimizer = model.configure_optimizers( weight_decay=0.001, learning_rate=learning_rate,  betas = betas, eps=0.001)
@@ -546,4 +546,3 @@ def train(model, criterion, optimizer, x_train, y_train, num_epochs=2000):
 
 
 train(model, criterion, optimizer, context_window, tar)
-
