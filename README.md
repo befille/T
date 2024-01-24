@@ -1,8 +1,6 @@
 simple = Toy implementation of MAMBA MOE.
 
-
-
-more = 
+more. =  
 u = uBx
 v = vBx
  
