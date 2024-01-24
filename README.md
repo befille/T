@@ -2,19 +2,15 @@ simple = Toy implementation of MAMBA MOE.
 
 
 
-more = i palyed around adding learned parameter XD to the attention(q*k) *v 
-
-residual = x
-
-learned paremeters XD
-
-x' = Attention(x)
-
-y = einsum (x', XD)
-
-x = y * F.silu(XD)
-
-x = x + residual
+more = 
+u = uBx
+v = vBx
+ 
+eu = e * u
+ev = e * v 
+r = eu * ev
+g = uv
+y = r - (g*r/2)
 
 
 offical = just quick implementation using the offical simple mamba
