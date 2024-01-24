@@ -1,177 +1,254 @@
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-import math
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn.init as init
 import matplotlib.pyplot as plt
 import datasets
-from einops import einsum, rearrange, repeat
+from einops import einsum
 
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    
+        """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+        bs, n_kv_heads, head_dim = x.shape
+        if n_rep == 1:
+            return x
+        return (
+            x[:, :, :, None, :]
+            .expand(bs, n_kv_heads, n_rep, head_dim)
+            .reshape(bs, n_kv_heads * n_rep, head_dim)
+        )
+
+    
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)).cuda()
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs).to(device=freqs.device)  # complex64
+    return freqs_cis
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    freqs_cis = freqs_cis[:x.shape[1], :]
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def rotate_half(x):
+    return torch.cat([-x[..., 1::2], x[..., ::2]], dim=-1)
+    
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+class GELU(nn.Module):
+    def forward(self, input):
+        return F.gelu(input)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, hidden_size, eps):
         """
-        RMSNorm is equivalent to T5LayerNorm
+        LlamaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        hidden_states_d = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states
     
-class MambaBlock(nn.Module):
-    """
-    "A single Mamba block, as described in Figure 3 in Section 3.4 in the Mamba paper [1]."
-    """
-    def __init__(
-        self,
-        dim: int = None,
-        d_state: int = 16,
-        expand: int = 2,
-        d_conv: int = 4,
-        conv_bias: bool = True,
-        bias: bool = False,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.d_state = d_state
-        self.expand = expand
-        self.d_conv = d_conv
-        self.conv_bias = conv_bias
-        self.bias = bias
 
-        # If dt_rank is not provided, set it to ceil(dim / d_state)
-        dt_rank = math.ceil(self.dim / 16)
-        self.dt_rank = dt_rank
-
-        # If dim_inner is not provided, set it to dim * expand
-        dim_inner = dim * expand
-        self.dim_inner = dim_inner
-
-        # If dim_inner is not provided, set it to dim * expand
-        self.in_proj = nn.Linear(dim, dim_inner * 2, bias=bias)
-
-        self.depthwise_separable_conv = nn.Sequential(
-            nn.Conv1d(in_channels=dim_inner, out_channels=dim_inner, kernel_size=d_conv, groups=dim_inner, padding=d_conv - 1, bias=False),
-            nn.Conv1d(in_channels=dim_inner, out_channels=dim_inner, kernel_size=1, bias=False)
-        )  #https://arxiv.org/pdf/1610.02357.pdf 
-
-        # x_proj takes in `x` and outputs the input-specific Δ, B, C
-        self.x_proj = nn.Linear(
-            dim_inner, dt_rank + self.d_state * 2, bias=False
-        )
-
-        # dt_proj projects Δ from dt_rank to d_in
-        self.dt_proj = nn.Linear(dt_rank, dim_inner, bias=True)
-
-        A = repeat(torch.arange(1, self.d_state + 1), "n -> d n", d=dim_inner)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.empty(dim_inner))
-        nn.init.uniform_(self.D, a=0.001, b=0.1)
-        self.out_proj = nn.Linear(dim_inner, dim, bias=bias)
-
-
-
-
-    def forward(self, x: Tensor):
-        """Mamba block forward. This looks the same as Figure 3 in Section 3.4 in the Mamba paper [1].
-
-        Args:
-            x: shape (b, l, d)    (See Glossary at top for definitions of b, l, d_in, n...)
-
-        Returns:
-            output: shape (b, l, d)
-
-
-        Official Implementation:
-            class Mamba, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L119
-            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-
-        """
-        (b, l, d) = x.shape
-        x_and_res = self.in_proj(x)  # shape (b, l, 2 * d_in)
-        x_and_res = rearrange(x_and_res, "b l x -> b x l")
-        (x, res) = x_and_res.split(
-            split_size=[self.dim_inner, self.dim_inner], dim=1
-        )
-
-        x = self.depthwise_separable_conv(x)[:, :, :l]
-        x = F.silu(x)
-
-        y = self.ssm(x)
-
-        y = y * F.silu(res)
-
-        output = self.out_proj(rearrange(y, "b dim l -> b l dim"))
-
-        return output
-
-    def ssm(self, x: Tensor):
-        """ - Algorithm 2 in Section 3.2 in the Mamba paper [1]
-
-        Args:
-            x: shape (b, d_in, l)    (See Glossary at top for definitions of b, l, d_in, n...)
-
-        Returns:
-            output: shape (b, d_in, l)
-
-        Official Implementation:
-            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-
-        """
-        (d_in, n) = self.A_log.shape
-
-        # Compute ∆ A B C D, the state space parameters.
-        #     A, D are input independent
-        #     ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4)
-
-        A = -torch.exp(self.A_log.float())  # shape (d_in, n)
-        D = self.D.float()
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+        super(RotaryEmbedding, self).__init__()
         
-        x_dbl = rearrange(x, "b d l -> b l d")
-        x_dbl = self.x_proj(x_dbl)  # (b, l, dt_rank + 2*n)
-
-        (delta, B, C) = x_dbl.split(
-            split_size=[self.dt_rank, n, n], dim=-1
-        )  # delta: (b, l, dt_rank). B, C: (b, l, n)
-        delta = F.softplus(self.dt_proj(delta))  # (b, l, d_in)
-
-        y = self.selective_scan(
-            x, delta, A, B, C, D
-        )  # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
-        return y
-
-    def selective_scan(self, u, delta, A, B, C, D):
-       
-        (b, d_in, l) = u.shape
-        n = A.shape[1]
-
-        # Discretize continuous parameters (Δ, A, B)  (see Section 2 Equation 4 in the Mamba paper [1])
-        # Note that B is parameterized directly
-        deltaA = torch.exp(einsum(delta, A, "b l d_in, d_in n -> b d_in l n"))
-        deltaB_u = einsum(
-            delta, B, u, "b l d_in, b l n, b d_in l -> b d_in l n"
+        self.dim = dim
+        self.scaling_factor = scaling_factor
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        # Initialize cache
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, 
+            device=self.inv_freq.device, 
+            dtype=torch.get_default_dtype()
         )
 
-        # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-        x = torch.zeros((b, d_in, n)).cuda()
-        ys = []
-        for i in range(l):
-            x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
-            y = einsum(x, C[:, i, :], "b d_in n , b n -> b d_in")
-            ys.append(y)
-        y = torch.stack(ys, dim=2)  # (b d_in l)
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = t / self.scaling_factor
 
-        if D is not None:
-            y = y + u * rearrange(D, "d_in -> d_in 1")
-        return y
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bsz, n_heads, T, head_dim]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+class LlamaDynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
+    """
+    Rotary Embedding extended with Dynamic NTK scaling.
+    """
+    
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+        self.scaling_factor = scaling_factor
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        super().__init__(dim, max_position_embeddings, base, device)
+
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        
+        # Recalculate base if seq_len exceeds max_position_embeddings
+        if seq_len > self.max_position_embeddings:
+            adjusted_base = self.base * (
+                (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
+            ) ** (self.dim / (self.dim - 2))
+            inv_freq = 1.0 / (adjusted_base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    
+
+    @staticmethod
+    def print_grad(module, grad_input, grad_output):
+        print(f"Gradients in FeedForward ({module}):")
+        print("Gradient at output of the module:", grad_output)
+        print("Gradient at input of the module:", grad_input)
+
+class attention2(nn.Module):
+    def __init__(self, h_dim, d_model, len, drop_p=None, attention_bias=False, rope_theta=10000):
+        super().__init__()
+        self.hidden_size = h_dim
+
+        self.d_model = d_model
+        self.len = len
+
+        # Initialize the linear layers
+        self.u_proj = nn.Linear(h_dim, h_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(h_dim, h_dim, bias=attention_bias)
+        self.r_proj = nn.Linear(h_dim, h_dim, bias=attention_bias)
+
+        
+        self.o_proj = nn.Linear(h_dim,  h_dim, bias=attention_bias)
+        
+        self.etab = nn.Parameter(torch.empty(1, len, self.d_model))
+        self.etac = nn.Parameter(torch.empty(1, len, self.d_model))
+        self.eta = nn.Parameter(torch.empty(h_dim, self.d_model))
+        nn.init.uniform_(self.etab, a=0.001, b=0.1)
+        nn.init.uniform_(self.etac, a=0.001, b=0.1)
+        nn.init.uniform_(self.eta, a=0.001, b=0.1)
+
+    def _shape(self, tensor, seq_len, bsz):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1,2).contiguous()
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, output_attentions=False):
+        bsz, q_len, _ = hidden_states.size()
+
+        # Use normal weights for q, k, v projections
+        u = self.u_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        resi = self.r_proj(hidden_states)
+
+
+        r = torch.exp(einsum(u, self.eta, "b l d_in, d_in n -> b d_in l n")) * torch.exp(einsum(v, self.eta, "b l d_in, d_in n -> b d_in l n"))
+        resi = resi.permute(0,2,1)
+        #eu = einsum(u, self.eta, "b l d_in, d_in n -> b d_in l n")) 
+        #ev=  torch.exp(einsum(v, self.eta, "b l d_in, d_in n -> b d_in l n"))
+        #u = einsum(u, self.etab, hidden_states, "b l d_in, b l n, b d_in l -> b d_in l n")
+        #v = einsum(v, self.etab, hidden_states, "b l d_in, b l n, b d_in l -> b d_in l n")
+        g = einsum(u, self.etab, resi, "b l d_in, b l n, b d_in l -> b d_in l n") * einsum(v, self.etab, resi, "b l d_in, b l n, b d_in l -> b d_in l n") 
+        x = torch.zeros((bsz, _, self.d_model)).cuda()
+        ys = []
+        for i in range(self.len):
+            x = r[:, :, i] * x - g[:, :, i]* r[:, :, i] / 2
+            y = einsum(x, self.etac[:, i, :], "b d_in n , b n -> b d_in")
+            ys.append(y)
+        y = torch.stack(ys, dim=2)# (b d_in l)
+        y = y * F.silu(resi)
+        attn_output = y.permute(0,2,1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+class attention(nn.Module):
+    def __init__(self, h_dim, max_T, n_heads, drop_p=None, attention_bias=False, rope_theta=10000):
+        super().__init__()
+        self.hidden_size = h_dim
+        self.num_heads = n_heads
+        self.head_dim = h_dim // n_heads
+        self.num_key_value_heads = n_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.scale = (self.head_dim) ** -0.5
+
+        # Initialize the linear layers
+        self.q_proj = nn.Linear(h_dim, n_heads * self.head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(h_dim, n_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(h_dim, n_heads * self.head_dim, bias=attention_bias)
+
+        self.o_proj = nn.Linear(n_heads * self.head_dim, h_dim, bias=attention_bias)
+        
+
+        self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(self.head_dim)
+        self.position_ids = torch.arange(0, max_T).unsqueeze(0)
+
+
+    def _shape(self, tensor, seq_len, bsz):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1,2).contiguous()
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, output_attentions=False):
+        bsz, q_len, _ = hidden_states.size()
+
+        # Use normal weights for q, k, v projections
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        # The rest of the attention mechanism as before
+        q = self._shape(q, q_len, bsz)
+        k = self._shape(k, q_len, bsz)
+        v = self._shape(v, q_len, bsz)
+
+        cos, sin = self.rotary_emb(v, seq_len=q_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, self.position_ids)
+
+        attn_weights = torch.einsum('bhsd,bhtd->bhst', q, k) / self.scale
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_output = torch.einsum('bhst,bhtd->bhsd', attn_weights, v)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
 
 
 class FeedForward(nn.Module):
@@ -226,37 +303,41 @@ class MoE(nn.Module):
         y = (y.view(*expert_weights.shape, -1) * expert_weights.unsqueeze(-1)).sum(dim=1)
         return y.view(*orig_shape)
 
-class MOEMamba(nn.Module):
+class Test(nn.Module):
 
     def __init__(
         self,
         dim: int,
-        n_blocks: int,
+        max_t: int,
+        d_model: int,
         dropout: float,
         heads: int,
-        d_state: int,
-        experts: int,
         horizon: int,
         eps : int,
         positive : bool = True,
+        attentioni: int = 1,
         expansion_rate: int = 2, # 2 ? 
-        *args,
-        **kwargs,
     ):
-        super(MOEMamba, self).__init__()
+        super(Test, self).__init__()
         self.dim = dim
         self.dropout = dropout
         self.heads = heads
-        self.n_blocks = n_blocks
-        self.positive = positive
-        if positive == True:
-            self.sig = torch.nn.Sigmoid()
-
+        self.max_t = max_t
         self.hidden_dim = dim * expansion_rate
+        self.positive = positive
 
         # Set up the blocks
-        self.mamba = nn.ModuleList([MambaBlock(dim=dim, d_state=d_state, *args, **kwargs).cuda() for _ in range(self.n_blocks)])
-        self.feed = nn.ModuleList([MoE(experts, num_experts_per_tok=2, dim=dim , multi=2).cuda() for _ in range(self.n_blocks)])
+        if attentioni == 1:
+            self.attention = attention(dim, max_t, heads)
+            self.attention2 = attention(dim, max_t, heads)
+
+        if attentioni == 2:
+            self.attention = attention2(dim, d_model, max_t, heads)
+            self.attention2 = attention2(dim, d_model, max_t, heads)
+
+        #self.feed = nn.ModuleList([MoE(experts, num_experts_per_tok=2, dim=dim , multi=2).cuda() for _ in range(self.n_blocks)])
+        self.feed = FeedForward(dim,  4)
+        self.feed2 = FeedForward(dim,  4)
 
 
         self.linear = nn.Linear(dim, dim, bias=False)
@@ -264,13 +345,14 @@ class MOEMamba(nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self.out.weight = self.linear.weight 
 
+
+
         self.head = nn.Sequential(
             nn.Linear(dim, dim, bias=False),
             nn.SiLU(),
             nn.Linear(dim, horizon, bias=False),
         )
 
-        #self.feed = FeedForward(dim,  4)
         self.rmsnormf = RMSNorm(dim  , eps=eps).cuda()
         self.rmsnorma = RMSNorm(dim , eps=eps).cuda()
 
@@ -279,15 +361,25 @@ class MOEMamba(nn.Module):
         x  = x.unsqueeze(0).permute(0, 2, 1) # => batch=1, context, feature
         x = self.linear(x)
 
-        for mamba, feed in zip(self.mamba, self.feed):
-            resi = x 
-            x = self.rmsnorma(x)
-            x = mamba(x)
-            x = x + resi
-            resi = x 
-            x = feed(x)
-            x = self.rmsnormf(x)
-            x = x + resi
+        resi = x 
+        x = self.rmsnorma(x)
+        x = self.attention(x)
+        x = x + resi
+        resi = x 
+
+        x = self.feed(x)
+        x = self.rmsnormf(x)
+        x = x + resi
+
+        resi = x 
+        x = self.rmsnorma(x)
+        x = self.attention2(x)
+        x = x + resi
+        resi = x 
+
+        x = self.feed2(x)
+        x = self.rmsnormf(x)
+        x = x + resi
 
         x = self.out(x)
         x = self.head(x)
@@ -296,6 +388,7 @@ class MOEMamba(nn.Module):
             x = self.sig(x)
         return x
     
+
     def init_weights(self):
         self.apply(init_weights)
 
@@ -315,9 +408,11 @@ class MOEMamba(nn.Module):
                     decay.add(fpn)
                 elif pn.endswith('weight')  and isinstance(m, blacklist_weight_modules):
                     no_decay.add(fpn)
-                if fpn.startswith('mamba'):
-                    if pn in ['A_log', 'D']:
+                if fpn.startswith('attention.eta'):
                         no_decay.add(fpn) 
+                if fpn.startswith('attention2.eta'):
+                        no_decay.add(fpn) 
+
         # validate that we considered every parameter
                     
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -350,12 +445,6 @@ def init_weights(model):
         # Initialize linear layers with Xavier (Glorot) initialization
         init.xavier_uniform_(model.weight)
         if model.bias is not None:
-            nn.init.constant_(model.bias, 0.01)
-
-    elif isinstance(model, nn.Conv1d):
-        # Initialize Conv2d layers with Kaiming Normal (He initialization)
-        init.kaiming_normal_(model.weight, mode='fan_out', nonlinearity='relu')
-        if model.bias is not None:
             nn.init.constant_(model.bias, 0)
 
     elif isinstance(model, nn.Embedding):
@@ -384,30 +473,29 @@ def load_and_split_dataset(context_len, horizon, load=True):
 
     return context_windows, tar_windows
 
-context_len = 256
+context_len = 96
 horizon = 32
-experts = 4
-positive = True   #all datapoints  are positive
-n_blocks = 8
+positive = False   #all datapoints  are positive
 heads = 8
 
-model = MOEMamba(
+model = Test(
     dim = context_len,
-    n_blocks = n_blocks,
+    max_t=6,
+    d_model= 16,
     dropout = 0.1,
     heads = heads,
-    d_state = 16,
-    experts = experts,
     horizon=horizon,
     eps=0.001,
     positive=positive, #trues if only positive values.
+    attentioni=2,
 ).cuda()
+ 
 model.init_weights() 
 
 learning_rate = 0.000001
 betas = (0.95, 0.999)
 
-optimizer = model.configure_optimizers( weight_decay=0.1, learning_rate=learning_rate,  betas = betas, eps=0.001)
+optimizer = model.configure_optimizers( weight_decay=0.001, learning_rate=learning_rate,  betas = betas, eps=0.001)
 criterion = nn.CrossEntropyLoss()
 
 context_window, tar = load_and_split_dataset(context_len, horizon)
@@ -417,6 +505,7 @@ losses = []
 fig, ax = plt.subplots()
 
 # Train the model
+
 def train(model, criterion, optimizer, x_train, y_train, num_epochs=2000):
     # Set the model to training mode
     model.train()
