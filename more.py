@@ -7,6 +7,8 @@ import torch
 import torch.nn.init as init
 import matplotlib.pyplot as plt
 import datasets
+from einops import einsum
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     
@@ -42,24 +44,11 @@ def rotate_half(x):
     return torch.cat([-x[..., 1::2], x[..., ::2]], dim=-1)
     
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    cos = cos[position_ids].unsqueeze(1)
-    sin = sin[position_ids].unsqueeze(1)
+    cos = cos[position_ids]
+    sin = sin[position_ids]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def apply_rotary_pos_emb4(q, k,k2,k3,k4, cos, sin, position_ids):
-    cos = cos[position_ids].unsqueeze(1)
-    sin = sin[position_ids].unsqueeze(1)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    k_embed2 = (k2 * cos) + (rotate_half(k) * sin)
-    k_embed3 = (k3 * cos) + (rotate_half(k) * sin)
-    k_embed4 = (k4 * cos) + (rotate_half(k) * sin)
-
-    return q_embed, k_embed, k_embed2, k_embed3, k_embed4
-
 
 class GELU(nn.Module):
     def forward(self, input):
@@ -156,6 +145,57 @@ class LlamaDynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         print("Gradient at output of the module:", grad_output)
         print("Gradient at input of the module:", grad_input)
 
+class attention2(nn.Module):
+    def __init__(self, h_dim, d_model, len, drop_p=None, attention_bias=False, rope_theta=10000):
+        super().__init__()
+        self.hidden_size = h_dim
+
+        self.d_model = d_model
+        self.len = len
+
+        # Initialize the linear layers
+        self.u_proj = nn.Linear(h_dim, h_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(h_dim, h_dim, bias=attention_bias)
+        
+        self.o_proj = nn.Linear(h_dim,  h_dim, bias=attention_bias)
+        
+        self.etab = nn.Parameter(torch.ones(1, len, self.d_model))
+        self.etac = nn.Parameter(torch.ones(1, len, self.d_model))
+        self.eta = nn.Parameter(torch.ones(h_dim, self.d_model))
+        nn.init.uniform_(self.etab, a=0.001, b=0.1)
+        nn.init.uniform_(self.etac, a=0.001, b=0.1)
+        nn.init.uniform_(self.eta, a=0.001, b=0.1)
+
+    def _shape(self, tensor, seq_len, bsz):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1,2).contiguous()
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, output_attentions=False):
+        bsz, q_len, _ = hidden_states.size()
+
+        # Use normal weights for q, k, v projections
+        u = self.u_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        r = torch.exp(einsum(u, self.eta, "b l d_in, d_in n -> b d_in l n")) * torch.exp(einsum(v, self.eta, "b l d_in, d_in n -> b d_in l n"))
+        hidden_states = hidden_states.permute(0,2,1)
+        #eu = einsum(u, self.eta, "b l d_in, d_in n -> b d_in l n")) 
+        #ev=  torch.exp(einsum(v, self.eta, "b l d_in, d_in n -> b d_in l n"))
+        #u = einsum(u, self.etab, hidden_states, "b l d_in, b l n, b d_in l -> b d_in l n")
+        #v = einsum(v, self.etab, hidden_states, "b l d_in, b l n, b d_in l -> b d_in l n")
+        g = einsum(u, self.etab, hidden_states, "b l d_in, b l n, b d_in l -> b d_in l n") * einsum(v, self.etab, hidden_states, "b l d_in, b l n, b d_in l -> b d_in l n") 
+        x = torch.zeros((bsz, _, self.d_model)).cuda()
+        ys = []
+        for i in range(self.len):
+            x = r[:, :, i] * x - g[:, :, i]* r[:, :, i]
+            y = einsum(x, self.etac[:, i, :], "b d_in n , b n -> b d_in")
+            ys.append(y)
+        y = torch.stack(ys, dim=2)# (b d_in l)
+        y = y * hidden_states
+        attn_output = y.permute(0,2,1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
 class attention(nn.Module):
     def __init__(self, h_dim, max_T, n_heads, drop_p=None, attention_bias=False, rope_theta=10000):
         super().__init__()
@@ -173,12 +213,7 @@ class attention(nn.Module):
 
         self.o_proj = nn.Linear(n_heads * self.head_dim, h_dim, bias=attention_bias)
         
-        # Print the shapes of the weights
-        #print("q_proj weight shape:", self.q_proj.weight.shape)
-        #print("k_proj weight shape:", self.k_proj.weight.shape)
-        #print("v_proj weight shape:", self.v_proj.weight.shape)
-        #print("o_proj weight shape:", self.o_proj.weight.shape)
-        # Rotary Embeddings Initialization
+
         self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(self.head_dim)
         self.position_ids = torch.arange(0, max_T).unsqueeze(0)
 
@@ -270,35 +305,43 @@ class Test(nn.Module):
         self,
         dim: int,
         max_t: int,
+        d_model: int,
         dropout: float,
         heads: int,
         horizon: int,
         eps : int,
         positive : bool = True,
+        attentioni: int = 1,
         expansion_rate: int = 2, # 2 ? 
     ):
         super(Test, self).__init__()
         self.dim = dim
         self.dropout = dropout
         self.heads = heads
-        self.positive = positive
-        if positive == True:
-            self.sig = torch.nn.Sigmoid()
-
+        self.max_t = max_t
         self.hidden_dim = dim * expansion_rate
-        xd =torch.ones(1, max_t, dim)
-        self.XD =  nn.Parameter(torch.log(xd))
+        self.positive = positive
 
         # Set up the blocks
-        self.attention = attention(dim, max_t, heads)
-        
+        if attentioni == 1:
+            self.attention = attention(dim, max_t, heads)
+            self.attention2 = attention(dim, max_t, heads)
+
+        if attentioni == 2:
+            self.attention = attention2(dim, d_model, max_t, heads)
+            self.attention2 = attention2(dim, d_model, max_t, heads)
+
         #self.feed = nn.ModuleList([MoE(experts, num_experts_per_tok=2, dim=dim , multi=2).cuda() for _ in range(self.n_blocks)])
         self.feed = FeedForward(dim,  4)
+        self.feed2 = FeedForward(dim,  4)
+
 
         self.linear = nn.Linear(dim, dim, bias=False)
 
         self.out = nn.Linear(dim, dim, bias=False)
         self.out.weight = self.linear.weight 
+
+
 
         self.head = nn.Sequential(
             nn.Linear(dim, dim, bias=False),
@@ -313,19 +356,25 @@ class Test(nn.Module):
     def forward(self, x):
         x  = x.unsqueeze(0).permute(0, 2, 1) # => batch=1, context, feature
         x = self.linear(x)
-    
+
         resi = x 
         x = self.rmsnorma(x)
         x = self.attention(x)
-        xd = self.XD.float()
-        fd = -torch.exp(xd)
-        y = torch.einsum('bht,bht->bht', x, fd)
-        x = y * F.silu(xd)
+        x = x + resi
+        resi = x 
+
+        x = self.feed(x)
+        x = self.rmsnormf(x)
         x = x + resi
 
         resi = x 
+        x = self.rmsnorma(x)
+        x = self.attention2(x)
+        x = x + resi
+        resi = x 
+
+        x = self.feed2(x)
         x = self.rmsnormf(x)
-        x = self.feed(x)
         x = x + resi
 
         x = self.out(x)
@@ -335,6 +384,7 @@ class Test(nn.Module):
             x = self.sig(x)
         return x
     
+
     def init_weights(self):
         self.apply(init_weights)
 
@@ -354,10 +404,11 @@ class Test(nn.Module):
                     decay.add(fpn)
                 elif pn.endswith('weight')  and isinstance(m, blacklist_weight_modules):
                     no_decay.add(fpn)
-                if fpn.startswith('FD' or 'XD'):
-                        decay.add(fpn) 
-                if fpn.startswith('XD'):
-                        decay.add(fpn) 
+                if fpn.startswith('attention.eta'):
+                        no_decay.add(fpn) 
+                if fpn.startswith('attention2.eta'):
+                        no_decay.add(fpn) 
+
         # validate that we considered every parameter
                     
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -390,12 +441,6 @@ def init_weights(model):
         # Initialize linear layers with Xavier (Glorot) initialization
         init.xavier_uniform_(model.weight)
         if model.bias is not None:
-            nn.init.constant_(model.bias, 0.01)
-
-    elif isinstance(model, nn.Conv1d):
-        # Initialize Conv2d layers with Kaiming Normal (He initialization)
-        init.kaiming_normal_(model.weight, mode='fan_out', nonlinearity='relu')
-        if model.bias is not None:
             nn.init.constant_(model.bias, 0)
 
     elif isinstance(model, nn.Embedding):
@@ -424,7 +469,7 @@ def load_and_split_dataset(context_len, horizon, load=True):
 
     return context_windows, tar_windows
 
-context_len = 256
+context_len = 96
 horizon = 32
 positive = False   #all datapoints  are positive
 heads = 8
@@ -432,18 +477,21 @@ heads = 8
 model = Test(
     dim = context_len,
     max_t=6,
+    d_model= 16,
     dropout = 0.1,
     heads = heads,
     horizon=horizon,
     eps=0.001,
     positive=positive, #trues if only positive values.
+    attentioni=2,
 ).cuda()
+ 
 model.init_weights() 
 
-learning_rate = 0.000001
+learning_rate = 0.000002
 betas = (0.95, 0.999)
 
-optimizer = model.configure_optimizers( weight_decay=0.1, learning_rate=learning_rate,  betas = betas, eps=0.001)
+optimizer = model.configure_optimizers( weight_decay=0.001, learning_rate=learning_rate,  betas = betas, eps=0.001)
 criterion = nn.CrossEntropyLoss()
 
 context_window, tar = load_and_split_dataset(context_len, horizon)
@@ -453,29 +501,49 @@ losses = []
 fig, ax = plt.subplots()
 
 # Train the model
-def train(model, criterion, optimizer, x_batch, y_batch, num_epochs=1000):
+
+def train(model, criterion, optimizer, x_train, y_train, num_epochs=2000):
     # Set the model to training mode
     model.train()
+    losses = []
+    val_losses = []
     plt.suptitle('Training Loss')
-        # Loop over the specified number of epochs
+
+    # Loop over the specified number of epochs
     for epoch in range(num_epochs):
-        # Zero the gradients of the optimizer
-        optimizer.zero_grad()
-        model.zero_grad()
-        output_tensor = model(x_batch)
-        loss = criterion(output_tensor, y_batch)
-        loss.backward()
-        # Update the weights
-        optimizer.step()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-        #for name, param in model.named_parameters():
-        #    if param.grad is not None:
-        #        print(f"{name}: {param.grad.data.abs().mean()}")
-        losses.append(loss.item())
-        ## Update the data in the subplots
-        ax.plot(losses, label='Training Loss')
-        ## Call the draw method to update the plot
-        plt.draw()
-        plt.pause(0.01)
+        try:
+            # Zero the gradients of the optimizer
+            optimizer.zero_grad()
+            model.zero_grad()
+            if (epoch + 1) % 100 == 0:
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                        output_tensor = model(x_train)
+                        val_loss += criterion(output_tensor, y_train).item()
+                val_losses.append(val_loss)
+                print(f'Epoch {epoch+1}, Validation Loss: {val_loss:.4f}')
+                model.train()
+
+            output_tensor = model(x_train)
+            loss = criterion(output_tensor, y_train)
+            loss.backward()
+            # Update the weights
+            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            losses.append(loss.item())
+
+            # Validate the model every 100 epochs
+            ## Update the data in the subplots
+            ax.plot(losses, label='Training Loss')
+            ax.plot(val_losses, label='Validation Loss')
+            ## Call the draw method to update the plot
+            plt.draw()
+            plt.pause(0.01)
+        except KeyboardInterrupt:
+            print('exit')
+            break
+
 
 train(model, criterion, optimizer, context_window, tar)
+
