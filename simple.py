@@ -315,7 +315,7 @@ class Test(nn.Module):
         heads: int,
         horizon: int,
         eps : int,
-        positive : bool = True,
+        positive : bool = False,
         attentioni: int = 1,
         expansion_rate: int = 2, # 2 ? 
     ):
@@ -387,8 +387,6 @@ class Test(nn.Module):
         x = self.out(x)
         x = self.head(x)
         x  = x.squeeze(0).permute(1, 0)  # => feature ,predictions till the horizon
-        if self.positive == True:
-            x = self.sig(x)
         return x
     
 
