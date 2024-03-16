@@ -310,6 +310,7 @@ class Test(nn.Module):
         dim: int,
         max_t: int,
         d_model: int,
+        experts: int,
         dropout: float,
         heads: int,
         horizon: int,
@@ -336,8 +337,10 @@ class Test(nn.Module):
             self.attention2 = attention2(dim, d_model, max_t, heads)
 
         #self.feed = nn.ModuleList([MoE(experts, num_experts_per_tok=2, dim=dim , multi=2).cuda() for _ in range(self.n_blocks)])
-        self.feed = FeedForward(dim,  4)
-        self.feed2 = FeedForward(dim,  4)
+        self.feed = MoE(experts, num_experts_per_tok=2, dim=dim , multi=2).cuda()
+        self.feed2 = MoE(experts, num_experts_per_tok=2, dim=dim , multi=2).cuda()
+        
+
 
 
         self.linear = nn.Linear(dim, dim, bias=False)
@@ -482,6 +485,7 @@ model = Test(
     dim = context_len,
     max_t=6,
     d_model= 16,
+    experts=8,
     dropout = 0.1,
     heads = heads,
     horizon=horizon,
